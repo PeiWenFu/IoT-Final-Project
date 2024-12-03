@@ -17,11 +17,11 @@
 // Pin numbers
 #define LIGHT_SENSOR_PIN 33
 #define LED_PIN 27
-#define ULSO_TRIG_PIN -1
-#define ULSO_ECHO_PIN -1
+#define ULSO_TRIG_PIN 12
+#define ULSO_ECHO_PIN 13
 #define BUZZER_PIN 32
-#define RX_PIN -1
-#define TX_PIN -1
+#define RX_PIN 15
+#define TX_PIN 2
 // Thresholds
 #define NIGHT_MODE_THRESHOLD 1000
 #define OBJECT_DETECTION_THRESHOLD 200
@@ -79,8 +79,8 @@ void nvs_access() {
     switch (err) { 
       case ESP_OK:
         Serial.printf("Done\n"); 
-        //Serial.printf("SSID = %s\n", ssid); 
-        //Serial.printf("PASSWD = %s\n", pass); 
+        // Serial.printf("SSID = %s\n", ssid); 
+        // Serial.printf("PASSWD = %s\n", pass); 
         break; 
       case ESP_ERR_NVS_NOT_FOUND: 
         Serial.printf("The value is not initialized yet!\n"); 
@@ -158,7 +158,6 @@ void sendToAWS(String url) {
 }
 
 TinyGPSPlus gps;
-HardwareSerial gpsSerial(1);
 
 void setup() {
   Serial.begin(9600);
@@ -186,7 +185,7 @@ void setup() {
   offsetZ = myIMU.readFloatAccelZ();
 
   // Connect to WiFi
-  nvs_access(); // Retrieve SSID/PASSWD from flash before anything else 
+  nvs_access(); // Retrieve SSID/PASSWD from flash
 
   delay(1000); 
   Serial.println(); 
@@ -210,14 +209,14 @@ void setup() {
   Serial.println();
 
   // Start gps serial
-  gpsSerial.begin(4800, SERIAL_8N1,RX_PIN, TX_PIN);
+  Serial2.begin(9600, SERIAL_8N1,TX_PIN, RX_PIN);
 }
 
 void loop() {
   // Automatic Night Lighting
   lightVal = analogRead(LIGHT_SENSOR_PIN);
-  Serial.print("lightVal: ");
-  Serial.println(lightVal);
+  // Serial.print("lightVal: ");
+  // Serial.println(lightVal);
   if (lightVal < NIGHT_MODE_THRESHOLD) {
     digitalWrite(LED_PIN, HIGH);
   } else {
@@ -229,8 +228,8 @@ void loop() {
   unsigned int distance = ultrasonic.read();
 
   if (distance < OBJECT_DETECTION_THRESHOLD) {
-    // Map the distance (10cm to 200cm) to a pause time range (200ms to 50ms)
-    pauseDuration = map(distance, 10, OBJECT_DETECTION_THRESHOLD, 200, 50);
+    // Map the distance (10cm to 200cm) to a pause time range (10ms to 200ms)
+    pauseDuration = map(distance, 10, OBJECT_DETECTION_THRESHOLD, 10, 200);
     
     unsigned long currentMillis = millis();
 
@@ -251,42 +250,46 @@ void loop() {
 
 
   // Theft Prevention System
-  // TODO: determine if the scooter is with the owner
-  // if (the owner is not around) {
-    float correctedX = myIMU.readFloatAccelX() - offsetX;
-    float correctedY = myIMU.readFloatAccelY() - offsetY;
-    float correctedZ = myIMU.readFloatAccelZ() - offsetZ;
-    float accelMagnitude = sqrt(pow(correctedX, 2) + 
-                                pow(correctedY, 2) + 
-                                pow(correctedZ, 2));
+  float correctedX = myIMU.readFloatAccelX() - offsetX;
+  float correctedY = myIMU.readFloatAccelY() - offsetY;
+  float correctedZ = myIMU.readFloatAccelZ() - offsetZ;
+  float accelMagnitude = sqrt(pow(correctedX, 2) + 
+                              pow(correctedY, 2) + 
+                              pow(correctedZ, 2));
 
-    if (millis() - lastDetectionTime > detectionCooldown) {
-        if (accelMagnitude > MOVING_THRESHOLD) {
-          // Get current time
-          // FIXME: use Wifi or gps to get time
-          time_t now = time(nullptr);
-          tm* local_tm = localtime(&now);
-          char formatted_tm[80];
-          strftime(formatted_tm, sizeof(formatted_tm), "%Y-%m-%d-%H:%M:%S", local_tm);
+  if (millis() - lastDetectionTime > detectionCooldown) {
+      if (accelMagnitude > MOVING_THRESHOLD) {
+        // Get current time
+        // FIXME: use Wifi or gps to get time
+        time_t now = time(nullptr);
+        tm* local_tm = localtime(&now);
+        char formatted_tm[80];
+        strftime(formatted_tm, sizeof(formatted_tm), "%Y-%m-%d-%H:%M:%S", local_tm);
 
-          // Send warning message to website
-          sendToAWS("/theft?message=Movement%20is%20detected%20at%20" + String(formatted_tm));
-          // Serial.println("Movement is detected at " + String(formatted_tm));
-          lastDetectionTime = millis();
-      }
+        // Send warning message to website
+        sendToAWS("/theft?message=Movement%20is%20detected%20at%20" + String(formatted_tm));
+        // Serial.println("Movement is detected at " + String(formatted_tm));
+        lastDetectionTime = millis();
     }
-  // }
+  }
 
 
   // Real-time Scooter Location Tracking
-  while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
+  while (Serial2.available() > 0) {
+    gps.encode(Serial2.read());
   }
   if (gps.location.isUpdated()) {
     String latitute = String(gps.location.lat(), 6);
     String longtitute = String(gps.location.lng(), 6);
 
+    // Serial.print("latitute: ");
+    // Serial.print(latitute);
+    // Serial.print(", longtitute: ");
+    // Serial.println(longtitute);
+
     // Send current location to the website
     sendToAWS("/gps?latitute=" + latitute + "&longtitute=" + longtitute);
   }
+  if (gps.charsProcessed() < 10)
+    Serial.println(F("WARNING: No GPS data.  Check wiring."));
 }
