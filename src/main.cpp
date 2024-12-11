@@ -24,16 +24,18 @@
 #define TX_PIN 2
 // Thresholds
 #define NIGHT_MODE_THRESHOLD 1000
-#define OBJECT_DETECTION_THRESHOLD 200
+#define OBJECT_DETECTION_THRESHOLD 350
 #define MOVING_THRESHOLD 0.5
+
 
 int lightVal;
 
 Ultrasonic ultrasonic(ULSO_TRIG_PIN, ULSO_ECHO_PIN);
-unsigned long previousMillis = 0;  
 unsigned long beepDuration = 100;  // Duration of each beep (100 ms)
 unsigned long pauseDuration = 200; // Initial pause duration (200 ms)
 bool isBeeping = false;
+TaskHandle_t distanceTaskHandle;
+TaskHandle_t buzzerTaskHandle;
 
 LSM6DSO myIMU; 
 float offsetX;
@@ -41,15 +43,19 @@ float offsetY;
 float offsetZ;
 unsigned long lastDetectionTime;
 const unsigned long detectionCooldown = 1000; // 1 second cooldown
+bool movementUpdated;
 
 char ssid[50]; // your network SSID (name) 
-char pass[50]; // your network password (use for WPA, or use 
-               // as key for WEP) 
-
+char pass[50]; // your network password (use for WPA, or use as key for WEP) 
 // Number of milliseconds to wait without receiving any data before we give up 
 const int kNetworkTimeout = 30 * 1000; 
 // Number of milliseconds to wait if no data is available before trying again 
 const int kNetworkDelay = 1000; 
+
+TinyGPSPlus gps;
+String latitude;
+String longitude;
+bool gpsUpdated;
 
 void nvs_access() { 
   // Initialize NVS 
@@ -100,7 +106,7 @@ void sendToAWS(String url) {
   WiFiClient c; 
   HttpClient http(c); 
 
-  err = http.get("54.183.166.218", 5000, url.c_str(), NULL);
+  err = http.get("54.177.79.48", 5000, url.c_str(), NULL);
   if (err == 0) { 
     Serial.println("startedRequest ok"); 
     
@@ -157,7 +163,50 @@ void sendToAWS(String url) {
   http.stop(); 
 }
 
-TinyGPSPlus gps;
+// Distance measurement task
+void distanceTask(void *pvParameters) {
+  for(;;) {
+    unsigned int distance = ultrasonic.read();
+
+    if (distance < OBJECT_DETECTION_THRESHOLD) {
+      pauseDuration = map(distance, 10, OBJECT_DETECTION_THRESHOLD, 10, 200);
+
+      // Notify the buzzer task to run
+      vTaskResume(buzzerTaskHandle);
+    } else {
+      // Turn off buzzer and pause the buzzer task
+      noTone(BUZZER_PIN);
+      isBeeping = false;
+      vTaskSuspend(buzzerTaskHandle); // Suspend the buzzer task when not needed
+    }
+
+    vTaskDelay(40 / portTICK_PERIOD_MS); // Run every 10ms
+  }
+}
+
+// Buzzer control task
+void buzzerTask(void *pvParameters) {
+  unsigned long lastToggleTime = millis();
+
+  for(;;) {
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - lastToggleTime >= (isBeeping ? beepDuration : pauseDuration)) {
+      lastToggleTime = currentMillis;
+
+      if (isBeeping) {
+        noTone(BUZZER_PIN);
+      } else {
+        tone(BUZZER_PIN, 1000);
+      }
+
+      isBeeping = !isBeeping;
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS); // Check every 10ms
+  }
+}
+
 
 void setup() {
   Serial.begin(9600);
@@ -166,6 +215,17 @@ void setup() {
   // Initialize LED
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  Serial.println("LED initialized. ");
+  Serial.println(xPortGetCoreID());
+
+  // Create distance and buzzer tasks
+  xTaskCreatePinnedToCore(buzzerTask, "Buzzer Task", 2048, NULL, 1, &buzzerTaskHandle, 0);
+  delay(500); 
+  xTaskCreatePinnedToCore(distanceTask, "Distance Task", 2048, NULL, 1, &distanceTaskHandle, 0);
+  delay(500); 
+  // Start FreeRTOS scheduler
+  vTaskStartScheduler();
+  Serial.println("Distance and buzzer tasks created. ");
 
   // Initialize accelerometer
   Wire.begin();
@@ -224,31 +284,6 @@ void loop() {
   }
 
 
-  // Pedestrian Detection and Warning
-  unsigned int distance = ultrasonic.read();
-
-  if (distance < OBJECT_DETECTION_THRESHOLD) {
-    // Map the distance (10cm to 200cm) to a pause time range (10ms to 200ms)
-    pauseDuration = map(distance, 10, OBJECT_DETECTION_THRESHOLD, 10, 200);
-    
-    unsigned long currentMillis = millis();
-
-    if (currentMillis - previousMillis >= (isBeeping ? beepDuration : pauseDuration)) {
-      previousMillis = currentMillis;
-
-      if (isBeeping) {
-        noTone(BUZZER_PIN);
-      } else {
-        tone(BUZZER_PIN, 1000);
-      }
-
-      isBeeping = !isBeeping;
-    }
-  } else {
-    noTone(BUZZER_PIN);
-  }
-
-
   // Theft Prevention System
   float correctedX = myIMU.readFloatAccelX() - offsetX;
   float correctedY = myIMU.readFloatAccelY() - offsetY;
@@ -257,20 +292,8 @@ void loop() {
                               pow(correctedY, 2) + 
                               pow(correctedZ, 2));
 
-  if (millis() - lastDetectionTime > detectionCooldown) {
-      if (accelMagnitude > MOVING_THRESHOLD) {
-        // Get current time
-        // FIXME: use Wifi or gps to get time
-        time_t now = time(nullptr);
-        tm* local_tm = localtime(&now);
-        char formatted_tm[80];
-        strftime(formatted_tm, sizeof(formatted_tm), "%Y-%m-%d-%H:%M:%S", local_tm);
-
-        // Send warning message to website
-        sendToAWS("/theft?message=Movement%20is%20detected%20at%20" + String(formatted_tm));
-        // Serial.println("Movement is detected at " + String(formatted_tm));
-        lastDetectionTime = millis();
-    }
+  if (accelMagnitude > MOVING_THRESHOLD) {
+        movementUpdated = true;
   }
 
 
@@ -279,17 +302,29 @@ void loop() {
     gps.encode(Serial2.read());
   }
   if (gps.location.isUpdated()) {
-    String latitute = String(gps.location.lat(), 6);
-    String longtitute = String(gps.location.lng(), 6);
+    latitude = String(gps.location.lat(), 6);
+    longitude = String(gps.location.lng(), 6);
+    gpsUpdated = true;
 
-    // Serial.print("latitute: ");
-    // Serial.print(latitute);
-    // Serial.print(", longtitute: ");
-    // Serial.println(longtitute);
-
-    // Send current location to the website
-    sendToAWS("/gps?latitute=" + latitute + "&longtitute=" + longtitute);
+    // Serial.print("latitude: ");
+    // Serial.print(latitude);
+    // Serial.print(", longitude: ");
+    // Serial.println(longitude);
   }
   if (gps.charsProcessed() < 10)
     Serial.println(F("WARNING: No GPS data.  Check wiring."));
+
+  // Send data to server
+  if (millis() - lastDetectionTime > detectionCooldown) {
+    if (movementUpdated && gpsUpdated) {
+      sendToAWS("/both?message=Movement%20is%20detected%20at%20&latitude=" + latitude + "&longitude=" + longitude);
+    } else if (movementUpdated) {
+      sendToAWS("/theft?message=Movement%20is%20detected%20at%20");
+    } else if (gpsUpdated) {
+      sendToAWS("/gps?latitude=" + latitude + "&longitude=" + longitude);
+    }
+    movementUpdated = false;
+    gpsUpdated = false;
+    lastDetectionTime = millis();
+  }
 }
